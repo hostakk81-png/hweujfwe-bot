@@ -1,0 +1,28 @@
+VERIFICATION
+==========
+Changed branch/fields: PostgreSQL Railway persistence (DATABASE_URL/ADMIN_IDS, users/events/broadcasts, indexed hot statistics); admin panel and broadcast constructor (formatting, optional photo, unlimited URL buttons with row positions, live sent/failed counters).
+
+MODIFIED_FILE: C:\Users\nolyk\Desktop\neiroham-bot-main\main.py
+DIFF_FILE: C:\Users\nolyk\Desktop\neiroham-bot-main\DIFF_FILE
+VERIFICATION.txt: C:\Users\nolyk\Desktop\neiroham-bot-main\VERIFICATION.txt
+ROLLBACK.sh: C:\Users\nolyk\Desktop\neiroham-bot-main\ROLLBACK.sh
+
+BASELINE
+Exact command: C:\Users\nolyk\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile main.py.orig
+Input: C:\Users\nolyk\Desktop\neiroham-bot-main\main.py.orig
+Literal output/result: no output
+Exit status: 0
+
+MODIFIED
+Exact command: C:\Users\nolyk\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile main.py
+Input: C:\Users\nolyk\Desktop\neiroham-bot-main\main.py
+Literal output/result: no output
+Exit status: 0
+
+ROLLBACK (tested on another copy)
+Exact command: "C:\Program Files\Git\bin\bash.exe" -lc "cd 'C:/Users/nolyk/Desktop/neiroham-bot-main' && ./ROLLBACK.sh rollback_fixture.py && cmp -s rollback_fixture.py rollback_fixture.py.orig"
+Input: rollback_fixture.py
+Literal output/result: rollback restored rollback_fixture.py from rollback_fixture.py.orig; ROLLBACK_COMPARE_EXIT=True
+Exit status: 0
+
+Restored behavior/status: rollback_fixture.py matched rollback_fixture.py.orig after rollback; MODIFIED_FILE remains changed and compiles successfully.
