@@ -136,6 +136,40 @@ def broadcast_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def broadcast_panel_text(session: dict[str, Any]) -> str:
+    return (
+        "📣 <b>конструктор рассылки</b>\n\n"
+        f"📝 текст: {'✅' if session.get('text') else '—'}\n"
+        f"🖼 фото: {'✅' if session.get('photo') else '—'}\n"
+        f"🔗 кнопок: {len(session.get('buttons', []))}\n\n"
+        "все настройки кнопки выбираются отдельными inline-кнопками."
+    )
+
+
+def button_editor_text(draft: dict[str, Any]) -> str:
+    style_labels = {"": "обычный", "primary": "синий", "success": "зелёный", "danger": "красный"}
+    return (
+        "🔗 <b>редактор inline-кнопки</b>\n\n"
+        f"текст: <code>{html.escape(draft.get('text') or 'не задан')}</code>\n"
+        f"ссылка: <code>{html.escape(draft.get('url') or 'не задана')}</code>\n"
+        f"стиль: <b>{style_labels.get(draft.get('style', ''), 'обычный')}</b>\n"
+        f"премиум-эмодзи: {'✅' if draft.get('icon_custom_emoji_id') else '—'}\n"
+        f"позиция: строка {draft.get('row', 0) + 1}, колонка {draft.get('column', 0) + 1}"
+    )
+
+
+def button_editor_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ текст", callback_data="btn:text"), InlineKeyboardButton(text="🔗 ссылка", callback_data="btn:url")],
+        [InlineKeyboardButton(text="✨ премиум-эмодзи", callback_data="btn:emoji")],
+        [InlineKeyboardButton(text="◻️ обычный", callback_data="btn:style:"), InlineKeyboardButton(text="🔵 синий", callback_data="btn:style:primary")],
+        [InlineKeyboardButton(text="🟢 зелёный", callback_data="btn:style:success"), InlineKeyboardButton(text="🔴 красный", callback_data="btn:style:danger")],
+        [InlineKeyboardButton(text="⬆️ выше", callback_data="btn:row:up"), InlineKeyboardButton(text="⬇️ ниже", callback_data="btn:row:down")],
+        [InlineKeyboardButton(text="⬅️ левее", callback_data="btn:column:left"), InlineKeyboardButton(text="➡️ правее", callback_data="btn:column:right")],
+        [InlineKeyboardButton(text="➕ добавить кнопку", callback_data="btn:save"), InlineKeyboardButton(text="⬅️ назад", callback_data="btn:cancel")],
+    ])
+
+
 def format_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="𝐁 жирный", callback_data="bc:toggle:bold"), InlineKeyboardButton(text="𝘐 курсив", callback_data="bc:toggle:italic")],
@@ -144,21 +178,36 @@ def format_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def format_text(text: str, options: dict[str, bool]) -> str:
-    value = html.escape(text)
-    if options.get("bold"): value = f"<b>{value}</b>"
-    if options.get("italic"): value = f"<i>{value}</i>"
-    if options.get("underline"): value = f"<u>{value}</u>"
-    if options.get("spoiler"): value = f"<tg-spoiler>{value}</tg-spoiler>"
-    return value
+def telegram_length(value: str) -> int:
+    """Telegram entity offsets are counted as UTF-16 code units."""
+    return len(value.encode("utf-16-le")) // 2
 
 
-def make_broadcast_markup(buttons: list[dict[str, str]]) -> InlineKeyboardMarkup | None:
+def serialize_entities(entities: list[types.MessageEntity] | None) -> list[dict[str, Any]]:
+    return [entity.model_dump(mode="json", exclude_none=True) for entity in entities or []]
+
+
+def broadcast_entities(text: str, saved: list[dict[str, Any]], options: dict[str, bool]) -> list[types.MessageEntity]:
+    entities = [types.MessageEntity(**item) for item in saved]
+    entity_length = telegram_length(text)
+    style_map = {"bold": "bold", "italic": "italic", "underline": "underline", "spoiler": "spoiler"}
+    for option, entity_type in style_map.items():
+        if options.get(option) and entity_length:
+            entities.append(types.MessageEntity(type=entity_type, offset=0, length=entity_length))
+    return entities
+
+
+def make_broadcast_markup(buttons: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
     if not buttons: return None
     rows: dict[int, list[InlineKeyboardButton]] = {}
-    for i, item in enumerate(buttons):
+    for item in sorted(buttons, key=lambda value: (int(value.get("row", 0)), int(value.get("column", 0)))):
         row = max(0, int(item.get("row", 0)))
-        rows.setdefault(row, []).append(InlineKeyboardButton(text=item["text"][:64], url=item["url"]))
+        button_data: dict[str, Any] = {"text": item["text"][:64], "url": item["url"]}
+        if item.get("style") in {"primary", "success", "danger"}:
+            button_data["style"] = item["style"]
+        if item.get("icon_custom_emoji_id"):
+            button_data["icon_custom_emoji_id"] = item["icon_custom_emoji_id"]
+        rows.setdefault(row, []).append(InlineKeyboardButton(**button_data))
     return InlineKeyboardMarkup(inline_keyboard=[rows[k] for k in sorted(rows)])
 
 
@@ -171,12 +220,13 @@ async def broadcast_send(admin_id: int, payload: dict[str, Any], status_message:
         bid = await conn.fetchval("INSERT INTO broadcasts(admin_id,payload,total,status) VALUES($1,$2,$3,'running') RETURNING id", admin_id, json.dumps(payload), len(users))
     sent = failed = 0
     markup = make_broadcast_markup(payload.get("buttons", []))
+    entities = broadcast_entities(payload.get("text", ""), payload.get("entities", []), payload.get("format", {}))
     for row in users:
         try:
             if payload.get("photo"):
-                await bot.send_photo(row["user_id"], payload["photo"], caption=payload.get("text", ""), parse_mode="HTML", reply_markup=markup)
+                await bot.send_photo(row["user_id"], payload["photo"], caption=payload.get("text", ""), caption_entities=entities, reply_markup=markup)
             else:
-                await bot.send_message(row["user_id"], payload.get("text", "") or " ", parse_mode="HTML", reply_markup=markup)
+                await bot.send_message(row["user_id"], payload.get("text", "") or " ", entities=entities, reply_markup=markup)
             sent += 1
         except Exception as exc:
             failed += 1
@@ -972,7 +1022,7 @@ async def message_handler(message: types.Message):
     chat_id = message.chat.id
     await track_user(message, "message")
 
-    if message.text.strip().split()[0] == "/admin" and is_admin(chat_id):
+    if message.text.strip().split() and message.text.strip().split()[0] == "/admin" and is_admin(chat_id):
         await message.answer("🛠 <b>админ панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
         return
 
@@ -980,19 +1030,31 @@ async def message_handler(message: types.Message):
         session = broadcast_sessions[chat_id]
         waiting = session.get("waiting_for")
         if waiting == "text":
-            session["text"] = format_text(message.text, session.get("format", {}))
+            session["text"] = message.text
+            session["entities"] = serialize_entities(message.entities)
             session["waiting_for"] = None
-            await message.answer("✅ текст сохранён", reply_markup=broadcast_keyboard())
+            await message.answer("✅ текст и премиум-эмодзи сохранены", reply_markup=broadcast_keyboard())
             return
-        if waiting == "button":
-            parts = [x.strip() for x in message.text.split("|", 2)]
-            if len(parts) < 2 or not re.match(r"^https?://", parts[1]):
-                await message.answer("формат: текст кнопки | https://ссылка | номер строки")
-                return
-            row = parts[2] if len(parts) == 3 and parts[2].isdigit() else "0"
-            session.setdefault("buttons", []).append({"text": parts[0], "url": parts[1], "row": row})
+        if waiting in {"button_text", "button_url", "button_emoji"}:
+            draft = session.setdefault("button_draft", {"text": "", "url": "", "style": "", "row": 0, "column": 0})
+            if waiting == "button_text":
+                draft["text"] = message.text[:64]
+                emoji_id = next((e.custom_emoji_id for e in (message.entities or []) if e.type == "custom_emoji"), None)
+                if emoji_id:
+                    draft["icon_custom_emoji_id"] = emoji_id
+            elif waiting == "button_url":
+                if not re.match(r"^(https?://|tg://)", message.text.strip()):
+                    await message.answer("ссылка должна начинаться с https://, http:// или tg://")
+                    return
+                draft["url"] = message.text.strip()
+            else:
+                emoji_id = next((e.custom_emoji_id for e in (message.entities or []) if e.type == "custom_emoji"), None)
+                if not emoji_id:
+                    await message.answer("отправь сообщение с одним премиум-эмодзи Telegram")
+                    return
+                draft["icon_custom_emoji_id"] = emoji_id
             session["waiting_for"] = None
-            await message.answer(f"✅ кнопка добавлена ({len(session['buttons'])})", reply_markup=broadcast_keyboard())
+            await message.answer(button_editor_text(draft), parse_mode="HTML", reply_markup=button_editor_keyboard())
             return
     session = ava_sessions.get(chat_id)
 
@@ -1061,12 +1123,20 @@ async def admin_stats(callback: CallbackQuery):
         parse_mode="HTML", reply_markup=admin_keyboard())
 
 
-@dp.callback_query(F.data.in_({"adm:broadcast", "adm:back"}))
+@dp.callback_query(F.data == "adm:broadcast")
 async def admin_broadcast(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
-    broadcast_sessions[callback.from_user.id] = {"text": "", "photo": None, "format": {}, "buttons": []}
+    broadcast_sessions[callback.from_user.id] = {"text": "", "entities": [], "photo": None, "format": {}, "buttons": []}
     await callback.answer()
-    await callback.message.edit_text("📣 <b>конструктор рассылки</b>\nВыберите блок. Кнопки можно добавлять без ограничений, строка задаёт позицию сверху вниз.", parse_mode="HTML", reply_markup=broadcast_keyboard())
+    await callback.message.edit_text(broadcast_panel_text(broadcast_sessions[callback.from_user.id]), parse_mode="HTML", reply_markup=broadcast_keyboard())
+
+
+@dp.callback_query(F.data == "adm:back")
+async def admin_back(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    broadcast_sessions.pop(callback.from_user.id, None)
+    await callback.answer()
+    await callback.message.edit_text("🛠 <b>админ панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
 
 
 @dp.callback_query(F.data == "adm:close")
@@ -1115,15 +1185,59 @@ async def bc_toggle_format(callback: CallbackQuery):
 async def bc_back(callback: CallbackQuery):
     if is_admin(callback.from_user.id):
         await callback.answer()
-        await callback.message.edit_text("📣 <b>конструктор рассылки</b>", parse_mode="HTML", reply_markup=broadcast_keyboard())
+        session = broadcast_sessions.setdefault(callback.from_user.id, {"text": "", "entities": [], "photo": None, "format": {}, "buttons": []})
+        await callback.message.edit_text(broadcast_panel_text(session), parse_mode="HTML", reply_markup=broadcast_keyboard())
 
 
 @dp.callback_query(F.data == "bc:buttons")
 async def bc_buttons(callback: CallbackQuery):
     if not is_admin(callback.from_user.id): return
-    broadcast_sessions.setdefault(callback.from_user.id, {})["waiting_for"] = "button"
+    session = broadcast_sessions.setdefault(callback.from_user.id, {"buttons": []})
+    row = 0
+    column = len([button for button in session.get("buttons", []) if int(button.get("row", 0)) == row])
+    session["button_draft"] = {"text": "", "url": "", "style": "", "row": row, "column": column}
     await callback.answer()
-    await callback.message.answer("добавьте кнопку: текст | https://ссылка | номер строки\nпример: сайт | https://railway.app | 0")
+    await callback.message.edit_text(button_editor_text(session["button_draft"]), parse_mode="HTML", reply_markup=button_editor_keyboard())
+
+
+@dp.callback_query(F.data.startswith("btn:"))
+async def button_editor(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    session = broadcast_sessions.setdefault(callback.from_user.id, {"buttons": []})
+    draft = session.get("button_draft")
+    if not draft:
+        await callback.answer("открой редактор кнопок заново", show_alert=True)
+        return
+    action = callback.data.split(":")
+    if action[1] in {"text", "url", "emoji"}:
+        session["waiting_for"] = f"button_{action[1]}"
+        prompts = {"text": "напиши текст кнопки", "url": "отправь ссылку", "emoji": "отправь премиум-эмодзи отдельным сообщением"}
+        await callback.answer()
+        await callback.message.answer(prompts[action[1]])
+        return
+    if action[1] == "style":
+        draft["style"] = action[2] if len(action) > 2 else ""
+    elif action[1] == "row":
+        draft["row"] = max(0, int(draft.get("row", 0)) + (-1 if action[2] == "up" else 1))
+    elif action[1] == "column":
+        draft["column"] = max(0, int(draft.get("column", 0)) + (-1 if action[2] == "left" else 1))
+    elif action[1] == "save":
+        if not draft.get("text") or not draft.get("url"):
+            await callback.answer("сначала укажи текст и ссылку", show_alert=True)
+            return
+        session.setdefault("buttons", []).append(dict(draft))
+        session.pop("button_draft", None)
+        await callback.answer("кнопка добавлена")
+        await callback.message.edit_text(broadcast_panel_text(session), parse_mode="HTML", reply_markup=broadcast_keyboard())
+        return
+    elif action[1] == "cancel":
+        session.pop("button_draft", None)
+        session["waiting_for"] = None
+        await callback.answer()
+        await callback.message.edit_text(broadcast_panel_text(session), parse_mode="HTML", reply_markup=broadcast_keyboard())
+        return
+    await callback.answer()
+    await callback.message.edit_text(button_editor_text(draft), parse_mode="HTML", reply_markup=button_editor_keyboard())
 
 
 @dp.callback_query(F.data == "bc:preview")
@@ -1132,10 +1246,11 @@ async def bc_preview(callback: CallbackQuery):
     s = broadcast_sessions.get(callback.from_user.id, {})
     await callback.answer()
     markup = make_broadcast_markup(s.get("buttons", []))
+    entities = broadcast_entities(s.get("text", ""), s.get("entities", []), s.get("format", {}))
     if s.get("photo"):
-        await callback.message.answer_photo(s["photo"], caption=s.get("text", "") or " ", parse_mode="HTML", reply_markup=markup)
+        await callback.message.answer_photo(s["photo"], caption=s.get("text", "") or " ", caption_entities=entities, reply_markup=markup)
     else:
-        await callback.message.answer(s.get("text", "") or "<i>пустой текст</i>", parse_mode="HTML", reply_markup=markup)
+        await callback.message.answer(s.get("text", "") or "пустой текст", entities=entities, reply_markup=markup)
 
 
 @dp.callback_query(F.data == "bc:send")
