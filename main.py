@@ -61,6 +61,7 @@ ava_sessions = {}
 db_pool = None
 broadcast_sessions: dict[int, dict[str, Any]] = {}
 broadcast_tasks: dict[int, asyncio.Task] = {}
+admin_sessions: dict[int, str] = {}
 
 
 def is_admin(user_id: int) -> bool:
@@ -91,10 +92,76 @@ async def init_db() -> None:
             sent INT NOT NULL DEFAULT 0, failed INT NOT NULL DEFAULT 0,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ
         );
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         CREATE INDEX IF NOT EXISTS events_created_idx ON events(created_at);
         CREATE INDEX IF NOT EXISTS events_type_idx ON events(event_type);
         CREATE INDEX IF NOT EXISTS users_last_seen_idx ON users(last_seen);
         """)
+
+
+async def get_subscription_targets() -> list[dict[str, Any]]:
+    if not db_pool:
+        return []
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval("SELECT value FROM bot_settings WHERE key='subscription_targets'")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    return raw if isinstance(raw, list) else []
+
+
+async def save_subscription_targets(targets: list[dict[str, Any]]) -> None:
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO bot_settings(key,value) VALUES('subscription_targets',$1)
+            ON CONFLICT(key) DO UPDATE SET value=$1, updated_at=now()""", json.dumps(targets))
+
+
+def subscription_keyboard(targets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    buttons = []
+    for target in targets:
+        link = target.get("link")
+        if link:
+            buttons.append([InlineKeyboardButton(text=f"📢 {target['title']}", url=link)])
+    buttons.append([InlineKeyboardButton(text="✅ проверить подписку", callback_data="sub:check")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def user_has_subscription(user_id: int) -> bool:
+    targets = await get_subscription_targets()
+    for target in targets:
+        try:
+            member = await bot.get_chat_member(target["chat_id"], user_id)
+            status = getattr(member.status, "value", member.status)
+            if status in {"left", "kicked"}:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+async def require_subscription(message: types.Message) -> bool:
+    if message.chat.type != "private" or is_admin(message.from_user.id):
+        return True
+    targets = await get_subscription_targets()
+    if not targets or await user_has_subscription(message.from_user.id):
+        return True
+    await message.answer("🔒 подпишись на обязательные каналы/чаты, потом нажми «проверить подписку».", reply_markup=subscription_keyboard(targets))
+    return False
+
+
+async def can_reply_in_chat(message: types.Message) -> bool:
+    if message.chat.type == "private":
+        return True
+    me = await bot.get_me()
+    mentioned = bool(message.text and me.username and f"@{me.username.lower()}" in message.text.lower())
+    replied_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == me.id)
+    return mentioned or replied_to_bot
 
 
 async def track_user(message: types.Message, event_type: str = "message") -> None:
@@ -123,6 +190,7 @@ async def stat_snapshot() -> dict[str, int]:
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 статистика", callback_data="adm:stats"), InlineKeyboardButton(text="📣 рассылка", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="🔒 обязательная подписка", callback_data="adm:subscription")],
         [InlineKeyboardButton(text="❌ закрыть", callback_data="adm:close")],
     ])
 
@@ -644,6 +712,8 @@ async def get_ai_response(chat_id: int, user_message: str) -> str:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await track_user(message, "start")
+    if not await require_subscription(message):
+        return
     await message.answer(
         "о, припёрся. ну ладно.\n\n"
         "я <b>лохограм</b> — ии с характером, не то говно что ты ожидал.\n\n"
@@ -684,6 +754,8 @@ async def cmd_clear(message: types.Message):
 @dp.message(Command("pic"))
 async def cmd_pic(message: types.Message):
     await track_user(message, "pic")
+    if not await require_subscription(message):
+        return
     user_request = message.text[4:].strip()
     if not user_request:
         await message.answer("Описание где? /pic [что нарисовать]")
@@ -716,6 +788,8 @@ async def cmd_pic(message: types.Message):
 @dp.message(Command("ava"))
 async def cmd_ava(message: types.Message):
     await track_user(message, "ava")
+    if not await require_subscription(message):
+        return
     chat_id = message.chat.id
     user_desc = message.text[4:].strip()
 
@@ -1022,6 +1096,9 @@ async def message_handler(message: types.Message):
     chat_id = message.chat.id
     await track_user(message, "message")
 
+    if not await require_subscription(message):
+        return
+
     if message.text.strip().split() and message.text.strip().split()[0] == "/admin" and is_admin(chat_id):
         await message.answer("🛠 <b>админ панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
         return
@@ -1056,6 +1133,27 @@ async def message_handler(message: types.Message):
             session["waiting_for"] = None
             await message.answer(button_editor_text(draft), parse_mode="HTML", reply_markup=button_editor_keyboard())
             return
+
+    if is_admin(chat_id) and admin_sessions.get(chat_id) == "subscription_target":
+        value = message.text.strip()
+        try:
+            chat = await bot.get_chat(value if value.startswith("@") else int(value))
+            link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
+            if not link:
+                link = await bot.export_chat_invite_link(chat.id)
+            targets = await get_subscription_targets()
+            target = {"chat_id": chat.id, "title": chat.title or getattr(chat, "full_name", None) or str(chat.id), "link": link}
+            targets = [item for item in targets if item["chat_id"] != chat.id] + [target]
+            await save_subscription_targets(targets)
+            admin_sessions.pop(chat_id, None)
+            await message.answer(f"✅ добавлено: {html.escape(target['title'])}", parse_mode="HTML", reply_markup=admin_keyboard())
+        except Exception as exc:
+            logging.warning("subscription target add failed: %s", exc)
+            await message.answer("не нашёл чат. Добавь бота в чат/канал и пришли @username либо числовой chat ID.")
+        return
+
+    if message.chat.type != "private" and not await can_reply_in_chat(message):
+        return
     session = ava_sessions.get(chat_id)
 
     if session and session.get("waiting_for") == "refinement":
@@ -1137,6 +1235,55 @@ async def admin_back(callback: CallbackQuery):
     broadcast_sessions.pop(callback.from_user.id, None)
     await callback.answer()
     await callback.message.edit_text("🛠 <b>админ панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
+
+
+def subscription_admin_keyboard(targets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="➕ добавить канал/чат", callback_data="subadm:add")]]
+    for target in targets:
+        rows.append([InlineKeyboardButton(text=f"🗑 убрать: {target['title'][:35]}", callback_data=f"subadm:remove:{target['chat_id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ назад", callback_data="adm:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm:subscription")
+async def admin_subscription(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    targets = await get_subscription_targets()
+    description = "\n".join(f"• {html.escape(item['title'])}" for item in targets) or "список пуст"
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🔒 <b>обязательная подписка</b>\n\n{description}\n\n"
+        "бот проверяет подписку перед личным диалогом.",
+        parse_mode="HTML", reply_markup=subscription_admin_keyboard(targets))
+
+
+@dp.callback_query(F.data == "subadm:add")
+async def subscription_add(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    admin_sessions[callback.from_user.id] = "subscription_target"
+    await callback.answer()
+    await callback.message.answer("пришли @username канала/группы или его числовой chat ID. Бота предварительно добавь туда.")
+
+
+@dp.callback_query(F.data.startswith("subadm:remove:"))
+async def subscription_remove(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id): return
+    chat_id = int(callback.data.rsplit(":", 1)[1])
+    targets = [item for item in await get_subscription_targets() if item["chat_id"] != chat_id]
+    await save_subscription_targets(targets)
+    await callback.answer("убрано")
+    await callback.message.edit_text(
+        "🔒 <b>обязательная подписка</b>\n\n" + ("\n".join(f"• {html.escape(item['title'])}" for item in targets) or "список пуст"),
+        parse_mode="HTML", reply_markup=subscription_admin_keyboard(targets))
+
+
+@dp.callback_query(F.data == "sub:check")
+async def subscription_check(callback: CallbackQuery):
+    if await user_has_subscription(callback.from_user.id):
+        await callback.answer("подписка подтверждена")
+        await callback.message.edit_text("✅ подписка подтверждена. Теперь можно пользоваться ботом.")
+    else:
+        await callback.answer("подписка пока не найдена", show_alert=True)
 
 
 @dp.callback_query(F.data == "adm:close")
