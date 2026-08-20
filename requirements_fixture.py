@@ -1,8 +1,8 @@
 aiogram==3.13.0
 python-dotenv==1.0.1
 openai==1.68.2
-aiohttp==3.11.13
+aiohttp==3.9.1
 requests==2.31.0
-pillow==11.1.0
+pillow==10.1.0
 pydantic==2.8.2
-asyncpg==0.30.0
+asyncpg==0.29.0

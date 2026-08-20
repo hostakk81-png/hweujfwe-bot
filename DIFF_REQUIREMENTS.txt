@@ -1,0 +1,8 @@
+MODIFIED_FILE: C:\Users\nolyk\Desktop\neiroham-bot-main\requirements.txt
+DIFF_FILE: C:\Users\nolyk\Desktop\neiroham-bot-main\DIFF_REQUIREMENTS.txt
+
+Changed branch/fields:
+- Python 3.13-compatible binary releases for aiohttp, Pillow, and asyncpg.
+- aiohttp 3.11.13 replaces source-only 3.9.1.
+- Pillow 11.1.0 replaces incompatible 10.1.0.
+- asyncpg 0.30.0 replaces older package.
