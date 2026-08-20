@@ -62,6 +62,7 @@ db_pool = None
 broadcast_sessions: dict[int, dict[str, Any]] = {}
 broadcast_tasks: dict[int, asyncio.Task] = {}
 admin_sessions: dict[int, str] = {}
+group_enabled_cache: dict[int, bool] = {}
 
 
 def is_admin(user_id: int) -> bool:
@@ -94,6 +95,10 @@ async def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS managed_chats (
+            chat_id BIGINT PRIMARY KEY, title TEXT NOT NULL, enabled_by BIGINT NOT NULL,
+            enabled_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS events_created_idx ON events(created_at);
         CREATE INDEX IF NOT EXISTS events_type_idx ON events(event_type);
@@ -162,6 +167,48 @@ async def can_reply_in_chat(message: types.Message) -> bool:
     mentioned = bool(message.text and me.username and f"@{me.username.lower()}" in message.text.lower())
     replied_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == me.id)
     return mentioned or replied_to_bot
+
+
+async def group_chat_enabled(chat_id: int) -> bool:
+    if chat_id in group_enabled_cache:
+        return group_enabled_cache[chat_id]
+    if not db_pool:
+        return False
+    async with db_pool.acquire() as conn:
+        enabled = bool(await conn.fetchval("SELECT EXISTS(SELECT 1 FROM managed_chats WHERE chat_id=$1)", chat_id))
+    group_enabled_cache[chat_id] = enabled
+    return enabled
+
+
+async def user_can_enable_group(message: types.Message) -> bool:
+    if is_admin(message.from_user.id):
+        return True
+    member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+    return getattr(member.status, "value", member.status) in {"administrator", "creator"}
+
+
+async def enable_group_chat(message: types.Message) -> None:
+    if message.chat.type == "private":
+        await message.answer("эту команду надо написать прямо в группе или супергруппе.")
+        return
+    try:
+        if not await user_can_enable_group(message):
+            await message.answer("/add может выполнить администратор этого чата.")
+            return
+    except Exception as exc:
+        logging.warning("group admin check failed: %s", exc)
+        await message.answer("не смог проверить права. Выдай боту доступ к участникам и повтори /add.")
+        return
+    if not db_pool:
+        await message.answer("DATABASE_URL не настроен.")
+        return
+    title = message.chat.title or str(message.chat.id)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""INSERT INTO managed_chats(chat_id,title,enabled_by) VALUES($1,$2,$3)
+            ON CONFLICT(chat_id) DO UPDATE SET title=$2, enabled_by=$3, enabled_at=now()""",
+            message.chat.id, title, message.from_user.id)
+    group_enabled_cache[message.chat.id] = True
+    await message.answer("✅ чат добавлен. Теперь я отвечаю на сообщения в этом чате и на упоминания.")
 
 
 async def track_user(message: types.Message, event_type: str = "message") -> None:
@@ -1099,7 +1146,12 @@ async def message_handler(message: types.Message):
     if not await require_subscription(message):
         return
 
-    if message.text.strip().split() and message.text.strip().split()[0] == "/admin" and is_admin(chat_id):
+    command = message.text.strip().split()[0].split("@", 1)[0] if message.text.strip().split() else ""
+    if command == "/add":
+        await enable_group_chat(message)
+        return
+
+    if command == "/admin" and is_admin(chat_id):
         await message.answer("🛠 <b>админ панель</b>", parse_mode="HTML", reply_markup=admin_keyboard())
         return
 
@@ -1152,7 +1204,7 @@ async def message_handler(message: types.Message):
             await message.answer("не нашёл чат. Добавь бота в чат/канал и пришли @username либо числовой chat ID.")
         return
 
-    if message.chat.type != "private" and not await can_reply_in_chat(message):
+    if message.chat.type != "private" and not (await group_chat_enabled(chat_id) or await can_reply_in_chat(message)):
         return
     session = ava_sessions.get(chat_id)
 
@@ -1425,6 +1477,13 @@ async def keep_alive():
 
 async def main():
     await init_db()
+    await bot.set_my_commands([
+        types.BotCommand(command="start", description="Запустить бота"),
+        types.BotCommand(command="help", description="Помощь"),
+        types.BotCommand(command="pic", description="Сгенерировать картинку"),
+        types.BotCommand(command="ava", description="Создать аватар"),
+        types.BotCommand(command="add", description="Включить бота в этом чате"),
+    ])
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(keep_alive())
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
